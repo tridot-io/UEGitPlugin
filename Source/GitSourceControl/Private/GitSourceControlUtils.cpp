@@ -218,6 +218,13 @@ bool RunCommandInternalRaw(const FString& InCommand, const FString& InPathToGitB
 		FullCommand += RepositoryRoot;
 		FullCommand += TEXT("\" ");
 	}
+	// [TriDot patch] git은 기본(core.quotePath=true)에서 비ASCII 경로를 "\355\205..." 식으로 따옴표·8진수 이스케이프해 출력한다.
+	// 플러그인은 status/log/diff 출력의 경로를 그대로 파일 키로 쓰므로, 한글 등 경로의 상태(최신 여부 등)가 맞지 않았다.
+	// RunLFSCommand는 같은 함수로 독립 git-lfs 실행 파일을 부르므로, git 자체일 때만 붙인다 (git-lfs는 -c를 모른다).
+	if (!FPaths::GetBaseFilename(InPathToGitBinary).StartsWith(TEXT("git-lfs")))
+	{
+		FullCommand += TEXT("-c core.quotePath=false ");
+	}
 	// then the git command itself ("status", "log", "commit"...)
 	LogableCommand += InCommand;
 
