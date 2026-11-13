@@ -124,9 +124,8 @@ static bool EnsureFilesAtRemoteHead(FGitSourceControlCommand& InCommand, TMap<co
 	};
 
 	// upstream "설정 없음"(로컬 전용 브랜치, detached HEAD)만 검사를 건너뛴다.
-	// 설정이 있는데 해석이 안 되는 경우(원격 추적 ref 없음 등)는 fetch 뒤 다시 해석하고, 그래도 실패하면 거부한다.
+	// 설정이 있으면 fetch 뒤 @{u}를 해석하고, 해석이 안 되면(원격 추적 ref 없음, fetch refspec 미매핑 등) 거부한다.
 	// --symbolic-full-name: 같은 이름의 태그가 있어도 refs/heads/<이름>을 준다 (--abbrev-ref는 heads/<이름>이 될 수 있음).
-	// for-each-ref %(upstream): 설정이 없으면 빈 출력으로 성공하므로, 명령 실패는 "없음"이 아니라 거부로 처리한다.
 	const TArray<FString> BranchParams{ TEXT("--symbolic-full-name"), TEXT("HEAD") };
 	if (!GitSourceControlUtils::RunCommand(TEXT("rev-parse"), InCommand.PathToGitBinary, Root, BranchParams,
 		FGitSourceControlModule::GetEmptyStringArray(), Results, Errors) || Results.Num() == 0)
@@ -139,20 +138,37 @@ static bool EnsureFilesAtRemoteHead(FGitSourceControlCommand& InCommand, TMap<co
 		UE_LOG(LogSourceControl, Warning, TEXT("Check out: HEAD in '%s' is not on a branch (%s), skipping latest-revision check."), *Root, *BranchRef);
 		return true;
 	}
+	const FString Branch = BranchRef.RightChop(11); // "refs/heads/"
+
+	// 설정 유무는 config 목록 전체에서 branch.<이름>.remote / .merge 키를 찾아 판정한다.
+	// 브랜치 이름을 명령줄 인수로 넘기지 않으므로 이름의 특수문자(따옴표 등)가 인수 파싱에 영향을 주지 않고,
+	// `config --list`는 키가 없어도 성공하므로 실패는 "없음"이 아니라 거부로 처리할 수 있다.
 	Results.Reset();
 	Errors.Reset();
-	const TArray<FString> UpstreamConfigParams{ TEXT("--format=%(upstream)"), BranchRef };
-	if (!GitSourceControlUtils::RunCommand(TEXT("for-each-ref"), InCommand.PathToGitBinary, Root, UpstreamConfigParams,
+	const TArray<FString> ConfigParams{ TEXT("--list") };
+	if (!GitSourceControlUtils::RunCommand(TEXT("config"), InCommand.PathToGitBinary, Root, ConfigParams,
 		FGitSourceControlModule::GetEmptyStringArray(), Results, Errors))
 	{
-		return Refuse(FString::Printf(TEXT("Check out refused: could not read the upstream of %s."), *BranchRef));
+		return Refuse(TEXT("Check out refused: could not read git config to find the upstream branch."));
 	}
-	if (Results.Num() == 0 || Results[0].TrimStartAndEnd().IsEmpty())
+	// 섹션(branch)은 대소문자 무시, 하위 섹션(브랜치 이름)은 대소문자 구분.
+	const FString RemoteKey = FString::Printf(TEXT(".%s.remote="), *Branch);
+	const FString MergeKey = FString::Printf(TEXT(".%s.merge="), *Branch);
+	bool bHasUpstreamConfig = false;
+	for (const FString& Line : Results)
+	{
+		if (Line.StartsWith(TEXT("branch."), ESearchCase::IgnoreCase)
+			&& (Line.Mid(6).StartsWith(RemoteKey, ESearchCase::CaseSensitive) || Line.Mid(6).StartsWith(MergeKey, ESearchCase::CaseSensitive)))
+		{
+			bHasUpstreamConfig = true;
+			break;
+		}
+	}
+	if (!bHasUpstreamConfig)
 	{
 		UE_LOG(LogSourceControl, Warning, TEXT("Check out: %s in '%s' has no upstream, skipping latest-revision check."), *BranchRef, *Root);
 		return true;
 	}
-	const FString Branch = BranchRef.RightChop(11); // "refs/heads/"
 
 	// 인수 없는 fetch는 현재 브랜치에 설정된 remote(=@{u}의 remote)를 받는다.
 	Results.Reset();
