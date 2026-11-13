@@ -124,7 +124,7 @@ static bool EnsureFilesAtRemoteHead(FGitSourceControlCommand& InCommand, TMap<co
 	};
 
 	// upstream "설정 없음"(로컬 전용 브랜치, detached HEAD)만 검사를 건너뛴다.
-	// 설정이 있으면 fetch 뒤 @{u}를 해석하고, 해석이 안 되면(원격 추적 ref 없음, fetch refspec 미매핑 등) 거부한다.
+	// 설정이 있으면 서버에 직접 그 브랜치의 커밋을 묻고 비교하며, 확인할 수 없으면 거부한다.
 	// --symbolic-full-name: 같은 이름의 태그가 있어도 refs/heads/<이름>을 준다 (--abbrev-ref는 heads/<이름>이 될 수 있음).
 	const TArray<FString> BranchParams{ TEXT("--symbolic-full-name"), TEXT("HEAD") };
 	if (!GitSourceControlUtils::RunCommand(TEXT("rev-parse"), InCommand.PathToGitBinary, Root, BranchParams,
@@ -140,9 +140,10 @@ static bool EnsureFilesAtRemoteHead(FGitSourceControlCommand& InCommand, TMap<co
 	}
 	const FString Branch = BranchRef.RightChop(11); // "refs/heads/"
 
-	// 설정 유무는 config 목록 전체에서 branch.<이름>.remote / .merge 키를 찾아 판정한다.
-	// 브랜치 이름을 명령줄 인수로 넘기지 않으므로 이름의 특수문자(따옴표 등)가 인수 파싱에 영향을 주지 않고,
+	// upstream 설정(branch.<이름>.remote / .merge)은 config 목록 전체에서 찾는다.
+	// 브랜치 이름을 명령줄 인수로 넘기지 않으므로 이름의 특수문자가 인수 파싱에 영향을 주지 않고,
 	// `config --list`는 키가 없어도 성공하므로 실패는 "없음"이 아니라 거부로 처리할 수 있다.
+	// 값 없는 키(`remote`만 있고 '=' 없음)도 "설정 있음"으로 보고, 값이 비면 아래에서 거부한다.
 	Results.Reset();
 	Errors.Reset();
 	const TArray<FString> ConfigParams{ TEXT("--list") };
@@ -151,17 +152,25 @@ static bool EnsureFilesAtRemoteHead(FGitSourceControlCommand& InCommand, TMap<co
 	{
 		return Refuse(TEXT("Check out refused: could not read git config to find the upstream branch."));
 	}
-	// 섹션(branch)은 대소문자 무시, 하위 섹션(브랜치 이름)은 대소문자 구분.
-	const FString RemoteKey = FString::Printf(TEXT(".%s.remote="), *Branch);
-	const FString MergeKey = FString::Printf(TEXT(".%s.merge="), *Branch);
+	// 섹션(branch)과 키 이름은 git이 소문자로 출력하고, 하위 섹션(브랜치 이름)은 대소문자를 유지한다.
+	const FString KeyPrefix = FString::Printf(TEXT("branch.%s."), *Branch);
 	bool bHasUpstreamConfig = false;
+	FString RemoteName;
+	FString MergeRef;
 	for (const FString& Line : Results)
 	{
-		if (Line.StartsWith(TEXT("branch."), ESearchCase::IgnoreCase)
-			&& (Line.Mid(6).StartsWith(RemoteKey, ESearchCase::CaseSensitive) || Line.Mid(6).StartsWith(MergeKey, ESearchCase::CaseSensitive)))
+		if (!Line.StartsWith(KeyPrefix, ESearchCase::CaseSensitive))
+		{
+			continue;
+		}
+		const FString Rest = Line.RightChop(KeyPrefix.Len());
+		FString Key = Rest;
+		FString Value;
+		const bool bHasValue = Rest.Split(TEXT("="), &Key, &Value);
+		if (Key == TEXT("remote") || Key == TEXT("merge"))
 		{
 			bHasUpstreamConfig = true;
-			break;
+			(Key == TEXT("remote") ? RemoteName : MergeRef) = bHasValue ? Value.TrimStartAndEnd() : FString();
 		}
 	}
 	if (!bHasUpstreamConfig)
@@ -169,33 +178,80 @@ static bool EnsureFilesAtRemoteHead(FGitSourceControlCommand& InCommand, TMap<co
 		UE_LOG(LogSourceControl, Warning, TEXT("Check out: %s in '%s' has no upstream, skipping latest-revision check."), *BranchRef, *Root);
 		return true;
 	}
+	if (RemoteName.IsEmpty() || MergeRef.IsEmpty())
+	{
+		return Refuse(FString::Printf(TEXT("Check out refused: upstream of '%s' is incomplete (branch.%s.remote / .merge)."), *Branch, *Branch));
+	}
+	// RunCommand는 인수를 따옴표 없이 이어 붙이므로 공백·따옴표가 든 이름은 안전하게 넘길 수 없다.
+	auto IsSafeArg = [](const FString& Arg) { return !Arg.Contains(TEXT(" ")) && !Arg.Contains(TEXT("\"")) && !Arg.Contains(TEXT("\t")); };
+	if (!IsSafeArg(RemoteName) || !IsSafeArg(MergeRef))
+	{
+		return Refuse(FString::Printf(TEXT("Check out refused: cannot verify upstream '%s %s' (unsupported characters)."), *RemoteName, *MergeRef));
+	}
+	const FString Upstream = FString::Printf(TEXT("%s %s"), *RemoteName, *MergeRef);
 
-	// 인수 없는 fetch는 현재 브랜치에 설정된 remote(=@{u}의 remote)를 받는다.
+	// 원격 추적 ref(fetch refspec·음수 refspec에 따라 갱신되지 않을 수 있음)를 믿지 않고,
+	// 서버에 그 브랜치의 현재 커밋을 직접 묻는다.
 	Results.Reset();
 	Errors.Reset();
-	const TArray<FString> FetchParams{ TEXT("--no-tags"), TEXT("--prune") };
-	if (!GitSourceControlUtils::RunCommand(TEXT("fetch"), InCommand.PathToGitBinary, Root, FetchParams,
+	const TArray<FString> LsRemoteParams{ RemoteName, MergeRef };
+	if (!GitSourceControlUtils::RunCommand(TEXT("ls-remote"), InCommand.PathToGitBinary, Root, LsRemoteParams,
 		FGitSourceControlModule::GetEmptyStringArray(), Results, Errors))
 	{
-		return Refuse(FString::Printf(TEXT("Check out refused: could not fetch the upstream of '%s' to verify the files are at the latest revision."), *Branch));
+		return Refuse(FString::Printf(TEXT("Check out refused: could not reach %s to verify the files are at the latest revision."), *Upstream));
+	}
+	FString RemoteHead;
+	for (const FString& Line : Results)
+	{
+		FString Sha;
+		FString Ref;
+		if (Line.Split(TEXT("\t"), &Sha, &Ref) && Ref.TrimStartAndEnd() == MergeRef)
+		{
+			RemoteHead = Sha.TrimStartAndEnd();
+			break;
+		}
+	}
+	if (RemoteHead.IsEmpty())
+	{
+		return Refuse(FString::Printf(TEXT("Check out refused: %s does not exist on the server."), *Upstream));
 	}
 
-	Results.Reset();
-	Errors.Reset();
-	const TArray<FString> UpstreamParams{ TEXT("--abbrev-ref"), TEXT("--symbolic-full-name"), TEXT("@{u}") };
-	if (!GitSourceControlUtils::RunCommand(TEXT("rev-parse"), InCommand.PathToGitBinary, Root, UpstreamParams,
-		FGitSourceControlModule::GetEmptyStringArray(), Results, Errors) || Results.Num() == 0 || Results[0].TrimStartAndEnd().IsEmpty())
+	// 그 커밋이 로컬에 없으면 받는다. 기본 fetch 후에도 없으면(refspec이 그 브랜치를 제외) 브랜치를 명시해 받는다.
+	auto HasCommit = [&InCommand, &Root, &RemoteHead]()
 	{
-		return Refuse(FString::Printf(TEXT("Check out refused: upstream of '%s' is configured but could not be resolved after fetch."), *Branch));
+		TArray<FString> R;
+		TArray<FString> E;
+		const TArray<FString> Params{ TEXT("-e"), RemoteHead + TEXT("^{commit}") };
+		return GitSourceControlUtils::RunCommand(TEXT("cat-file"), InCommand.PathToGitBinary, Root, Params,
+			FGitSourceControlModule::GetEmptyStringArray(), R, E);
+	};
+	if (!HasCommit())
+	{
+		Results.Reset();
+		Errors.Reset();
+		const TArray<FString> FetchParams{ TEXT("--no-tags"), RemoteName };
+		GitSourceControlUtils::RunCommand(TEXT("fetch"), InCommand.PathToGitBinary, Root, FetchParams,
+			FGitSourceControlModule::GetEmptyStringArray(), Results, Errors);
+		if (!HasCommit())
+		{
+			Results.Reset();
+			Errors.Reset();
+			const TArray<FString> ExplicitFetchParams{ TEXT("--no-tags"), RemoteName, MergeRef };
+			GitSourceControlUtils::RunCommand(TEXT("fetch"), InCommand.PathToGitBinary, Root, ExplicitFetchParams,
+				FGitSourceControlModule::GetEmptyStringArray(), Results, Errors);
+			if (!HasCommit())
+			{
+				return Refuse(FString::Printf(TEXT("Check out refused: could not fetch %s (%s)."), *Upstream, *RemoteHead));
+			}
+		}
 	}
-	const FString Upstream = Results[0].TrimStartAndEnd();
 
 	// 경로 필터 없이 아직 받지 않은 커밋의 변경 파일 전체를 받아 요청 파일과 대조한다.
 	// (pathspec은 대소문자를 구분해 Windows에서 casing이 다른 요청을 놓친다. FString 비교·TSet은 대소문자 무시.)
 	// --no-renames: 원격에서 이름이 바뀐 파일도 옛 경로로 나온다. 비ASCII 경로는 RunCommand가 core.quotePath=false로 받는다.
 	Results.Reset();
 	Errors.Reset();
-	const TArray<FString> LogParams{ TEXT("--no-renames"), TEXT("--pretty="), TEXT("--name-only"), TEXT("HEAD..@{u}") };
+	const TArray<FString> LogParams{ TEXT("--no-renames"), TEXT("--pretty="), TEXT("--name-only"), FString::Printf(TEXT("HEAD..%s"), *RemoteHead) };
 	if (!GitSourceControlUtils::RunCommand(TEXT("log"), InCommand.PathToGitBinary, Root, LogParams,
 		FGitSourceControlModule::GetEmptyStringArray(), Results, Errors))
 	{
