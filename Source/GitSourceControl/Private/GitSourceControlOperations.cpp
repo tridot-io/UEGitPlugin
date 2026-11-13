@@ -125,25 +125,34 @@ static bool EnsureFilesAtRemoteHead(FGitSourceControlCommand& InCommand, TMap<co
 
 	// upstream "설정 없음"(로컬 전용 브랜치, detached HEAD)만 검사를 건너뛴다.
 	// 설정이 있는데 해석이 안 되는 경우(원격 추적 ref 없음 등)는 fetch 뒤 다시 해석하고, 그래도 실패하면 거부한다.
-	const TArray<FString> BranchParams{ TEXT("--abbrev-ref"), TEXT("HEAD") };
+	// --symbolic-full-name: 같은 이름의 태그가 있어도 refs/heads/<이름>을 준다 (--abbrev-ref는 heads/<이름>이 될 수 있음).
+	// for-each-ref %(upstream): 설정이 없으면 빈 출력으로 성공하므로, 명령 실패는 "없음"이 아니라 거부로 처리한다.
+	const TArray<FString> BranchParams{ TEXT("--symbolic-full-name"), TEXT("HEAD") };
 	if (!GitSourceControlUtils::RunCommand(TEXT("rev-parse"), InCommand.PathToGitBinary, Root, BranchParams,
 		FGitSourceControlModule::GetEmptyStringArray(), Results, Errors) || Results.Num() == 0)
 	{
 		return Refuse(TEXT("Check out refused: could not read the current branch."));
 	}
-	const FString Branch = Results[0].TrimStartAndEnd();
-	Results.Reset();
-	Errors.Reset();
-	const TArray<FString> MergeParams{ TEXT("--get"), FString::Printf(TEXT("branch.%s.merge"), *Branch) };
-	const bool bHasUpstreamConfig = Branch != TEXT("HEAD")
-		&& GitSourceControlUtils::RunCommand(TEXT("config"), InCommand.PathToGitBinary, Root, MergeParams,
-			FGitSourceControlModule::GetEmptyStringArray(), Results, Errors)
-		&& Results.Num() > 0 && !Results[0].TrimStartAndEnd().IsEmpty();
-	if (!bHasUpstreamConfig)
+	const FString BranchRef = Results[0].TrimStartAndEnd();
+	if (!BranchRef.StartsWith(TEXT("refs/heads/"), ESearchCase::CaseSensitive))
 	{
-		UE_LOG(LogSourceControl, Warning, TEXT("Check out: branch '%s' in '%s' has no upstream, skipping latest-revision check."), *Branch, *Root);
+		UE_LOG(LogSourceControl, Warning, TEXT("Check out: HEAD in '%s' is not on a branch (%s), skipping latest-revision check."), *Root, *BranchRef);
 		return true;
 	}
+	Results.Reset();
+	Errors.Reset();
+	const TArray<FString> UpstreamConfigParams{ TEXT("--format=%(upstream)"), BranchRef };
+	if (!GitSourceControlUtils::RunCommand(TEXT("for-each-ref"), InCommand.PathToGitBinary, Root, UpstreamConfigParams,
+		FGitSourceControlModule::GetEmptyStringArray(), Results, Errors))
+	{
+		return Refuse(FString::Printf(TEXT("Check out refused: could not read the upstream of %s."), *BranchRef));
+	}
+	if (Results.Num() == 0 || Results[0].TrimStartAndEnd().IsEmpty())
+	{
+		UE_LOG(LogSourceControl, Warning, TEXT("Check out: %s in '%s' has no upstream, skipping latest-revision check."), *BranchRef, *Root);
+		return true;
+	}
+	const FString Branch = BranchRef.RightChop(11); // "refs/heads/"
 
 	// 인수 없는 fetch는 현재 브랜치에 설정된 remote(=@{u}의 remote)를 받는다.
 	Results.Reset();
