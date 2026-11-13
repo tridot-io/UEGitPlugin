@@ -96,6 +96,67 @@ FName FGitCheckOutWorker::GetName() const
 	return "CheckOut";
 }
 
+// [TriDot patch] 체크아웃 직전 원격 확인.
+// 원본은 30초 주기 백그라운드 fetch로 갱신된 캐시 상태만 보고 잠그므로, 에디터를 켠 직후나
+// 남이 제출한 직후에는 옛 판 파일에 잠금이 걸린다. 여기서 직접 fetch한 뒤 HEAD..upstream 사이에
+// 대상 파일 변경이 있으면 잠그지 않는다.
+static bool EnsureFilesAtRemoteHead(FGitSourceControlCommand& InCommand, const TArray<FString>& InRelativeFiles, TMap<const FString, FGitState>& OutStates)
+{
+	TArray<FString> Results;
+	TArray<FString> Errors;
+	const TArray<FString> FetchParams{ TEXT("--no-tags"), TEXT("--prune") };
+	if (!GitSourceControlUtils::RunCommand(TEXT("fetch"), InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, FetchParams,
+		FGitSourceControlModule::GetEmptyStringArray(), Results, Errors))
+	{
+		InCommand.ResultInfo.ErrorMessages.Add(TEXT("Check out refused: could not fetch from remote to verify the files are at the latest revision."));
+		InCommand.ResultInfo.ErrorMessages.Append(Errors);
+		return false;
+	}
+
+	FString Upstream;
+	if (!GitSourceControlUtils::GetRemoteBranchName(InCommand.PathToGitBinary, InCommand.PathToRepositoryRoot, Upstream) || Upstream.IsEmpty())
+	{
+		// 추적 원격 브랜치가 없으면 비교할 대상이 없다 (로컬 전용 브랜치).
+		UE_LOG(LogSourceControl, Warning, TEXT("Check out: no upstream branch, skipping latest-revision check."));
+		return true;
+	}
+
+	Results.Reset();
+	Errors.Reset();
+	const TArray<FString> LogParams{ TEXT("--pretty="), TEXT("--name-only"), FString::Printf(TEXT("HEAD..%s"), *Upstream), TEXT("--") };
+	if (!GitSourceControlUtils::RunCommand(TEXT("log"), InCommand.PathToGitBinary, InCommand.PathToGitRoot, LogParams, InRelativeFiles, Results, Errors))
+	{
+		InCommand.ResultInfo.ErrorMessages.Add(TEXT("Check out refused: could not compare files with the remote branch."));
+		InCommand.ResultInfo.ErrorMessages.Append(Errors);
+		return false;
+	}
+
+	TSet<FString> Newer;
+	for (const FString& Line : Results)
+	{
+		const FString Trimmed = Line.TrimStartAndEnd();
+		if (!Trimmed.IsEmpty())
+		{
+			Newer.Add(Trimmed);
+		}
+	}
+	if (Newer.Num() == 0)
+	{
+		return true;
+	}
+
+	TArray<FString> AbsoluteNewer;
+	for (const FString& RelativeFile : Newer)
+	{
+		FString AbsoluteFile = FPaths::Combine(InCommand.PathToGitRoot, RelativeFile);
+		FPaths::NormalizeFilename(AbsoluteFile);
+		AbsoluteNewer.Add(AbsoluteFile);
+		InCommand.ResultInfo.ErrorMessages.Add(FString::Printf(TEXT("Check out refused: '%s' has a newer revision on %s. Sync first."), *RelativeFile, *Upstream));
+	}
+	GitSourceControlUtils::CollectNewStates(AbsoluteNewer, OutStates, EFileState::Unset, ETreeState::Unset, ELockState::Unset, ERemoteState::NotAtHead);
+	return false;
+}
+
 bool FGitCheckOutWorker::Execute(FGitSourceControlCommand& InCommand)
 {
 	// If we have nothing to process, exit immediately
@@ -120,6 +181,12 @@ bool FGitCheckOutWorker::Execute(FGitSourceControlCommand& InCommand)
 	if (LockableRelativeFiles.Num() < 1)
 	{
 		InCommand.bCommandSuccessful = true;
+		return InCommand.bCommandSuccessful;
+	}
+
+	if (!EnsureFilesAtRemoteHead(InCommand, LockableRelativeFiles, States))
+	{
+		InCommand.bCommandSuccessful = false;
 		return InCommand.bCommandSuccessful;
 	}
 
