@@ -155,6 +155,7 @@ static bool EnsureFilesAtRemoteHead(FGitSourceControlCommand& InCommand, TMap<co
 	// 섹션(branch)과 키 이름은 git이 소문자로 출력하고, 하위 섹션(브랜치 이름)은 대소문자를 유지한다.
 	const FString KeyPrefix = FString::Printf(TEXT("branch.%s."), *Branch);
 	bool bHasUpstreamConfig = false;
+	int32 MergeCount = 0;
 	FString RemoteName;
 	FString MergeRef;
 	for (const FString& Line : Results)
@@ -170,6 +171,7 @@ static bool EnsureFilesAtRemoteHead(FGitSourceControlCommand& InCommand, TMap<co
 		if (Key == TEXT("remote") || Key == TEXT("merge"))
 		{
 			bHasUpstreamConfig = true;
+			MergeCount += Key == TEXT("merge") ? 1 : 0;
 			(Key == TEXT("remote") ? RemoteName : MergeRef) = bHasValue ? Value.TrimStartAndEnd() : FString();
 		}
 	}
@@ -177,6 +179,11 @@ static bool EnsureFilesAtRemoteHead(FGitSourceControlCommand& InCommand, TMap<co
 	{
 		UE_LOG(LogSourceControl, Warning, TEXT("Check out: %s in '%s' has no upstream, skipping latest-revision check."), *BranchRef, *Root);
 		return true;
+	}
+	// merge가 여러 개면 git의 @{u}는 첫 값을 쓰는데 위 파싱은 마지막 값을 남긴다. 어느 쪽과 비교할지 단정하지 않고 거부한다.
+	if (MergeCount > 1)
+	{
+		return Refuse(FString::Printf(TEXT("Check out refused: branch.%s.merge has %d values; only a single upstream branch is supported."), *Branch, MergeCount));
 	}
 	if (RemoteName.IsEmpty() || MergeRef.IsEmpty())
 	{
