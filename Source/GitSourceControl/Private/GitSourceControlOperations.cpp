@@ -102,7 +102,8 @@ FName FGitCheckOutWorker::GetName() const
 // 대상 파일 변경이 있으면 잠그지 않는다.
 // - 저장소 기준: 서브모듈이면 Command가 바꿔 둔 PathToRepositoryRoot 하나로 조회·fetch·비교·상대 경로를 맞춘다.
 // - upstream: Provider 캐시가 아니라 명령 시점에 그 저장소에서 다시 조회한다 (에디터 실행 중 브랜치 전환 대비).
-// - 경로: git 출력을 상태 키로 쓰지 않고 요청 파일과 대조해 요청 파일만 NotAtHead로 표시한다.
+// - 경로: git 출력을 상태 키로 쓰지 않고 요청 파일과 (대소문자 무시로) 대조해 요청 파일만 NotAtHead로 표시한다.
+// - upstream 설정이 없을 때만 검사를 건너뛰고, 설정이 있는데 확인할 수 없으면 거부한다.
 static bool EnsureFilesAtRemoteHead(FGitSourceControlCommand& InCommand, TMap<const FString, FGitState>& OutStates)
 {
 	const FString& Root = InCommand.PathToRepositoryRoot;
@@ -115,15 +116,34 @@ static bool EnsureFilesAtRemoteHead(FGitSourceControlCommand& InCommand, TMap<co
 
 	TArray<FString> Results;
 	TArray<FString> Errors;
-	const TArray<FString> UpstreamParams{ TEXT("--abbrev-ref"), TEXT("--symbolic-full-name"), TEXT("@{u}") };
-	if (!GitSourceControlUtils::RunCommand(TEXT("rev-parse"), InCommand.PathToGitBinary, Root, UpstreamParams,
-		FGitSourceControlModule::GetEmptyStringArray(), Results, Errors) || Results.Num() == 0 || Results[0].TrimStartAndEnd().IsEmpty())
+	auto Refuse = [&InCommand, &Errors](const FString& Message)
 	{
-		// 추적 원격 브랜치가 없으면 비교할 대상이 없다 (로컬 전용 브랜치).
-		UE_LOG(LogSourceControl, Warning, TEXT("Check out: no upstream branch in '%s', skipping latest-revision check."), *Root);
+		InCommand.ResultInfo.ErrorMessages.Add(Message);
+		InCommand.ResultInfo.ErrorMessages.Append(Errors);
+		return false;
+	};
+
+	// upstream "설정 없음"(로컬 전용 브랜치, detached HEAD)만 검사를 건너뛴다.
+	// 설정이 있는데 해석이 안 되는 경우(원격 추적 ref 없음 등)는 fetch 뒤 다시 해석하고, 그래도 실패하면 거부한다.
+	const TArray<FString> BranchParams{ TEXT("--abbrev-ref"), TEXT("HEAD") };
+	if (!GitSourceControlUtils::RunCommand(TEXT("rev-parse"), InCommand.PathToGitBinary, Root, BranchParams,
+		FGitSourceControlModule::GetEmptyStringArray(), Results, Errors) || Results.Num() == 0)
+	{
+		return Refuse(TEXT("Check out refused: could not read the current branch."));
+	}
+	const FString Branch = Results[0].TrimStartAndEnd();
+	Results.Reset();
+	Errors.Reset();
+	const TArray<FString> MergeParams{ TEXT("--get"), FString::Printf(TEXT("branch.%s.merge"), *Branch) };
+	const bool bHasUpstreamConfig = Branch != TEXT("HEAD")
+		&& GitSourceControlUtils::RunCommand(TEXT("config"), InCommand.PathToGitBinary, Root, MergeParams,
+			FGitSourceControlModule::GetEmptyStringArray(), Results, Errors)
+		&& Results.Num() > 0 && !Results[0].TrimStartAndEnd().IsEmpty();
+	if (!bHasUpstreamConfig)
+	{
+		UE_LOG(LogSourceControl, Warning, TEXT("Check out: branch '%s' in '%s' has no upstream, skipping latest-revision check."), *Branch, *Root);
 		return true;
 	}
-	const FString Upstream = Results[0].TrimStartAndEnd();
 
 	// 인수 없는 fetch는 현재 브랜치에 설정된 remote(=@{u}의 remote)를 받는다.
 	Results.Reset();
@@ -132,20 +152,29 @@ static bool EnsureFilesAtRemoteHead(FGitSourceControlCommand& InCommand, TMap<co
 	if (!GitSourceControlUtils::RunCommand(TEXT("fetch"), InCommand.PathToGitBinary, Root, FetchParams,
 		FGitSourceControlModule::GetEmptyStringArray(), Results, Errors))
 	{
-		InCommand.ResultInfo.ErrorMessages.Add(FString::Printf(TEXT("Check out refused: could not fetch %s to verify the files are at the latest revision."), *Upstream));
-		InCommand.ResultInfo.ErrorMessages.Append(Errors);
-		return false;
+		return Refuse(FString::Printf(TEXT("Check out refused: could not fetch the upstream of '%s' to verify the files are at the latest revision."), *Branch));
 	}
 
+	Results.Reset();
+	Errors.Reset();
+	const TArray<FString> UpstreamParams{ TEXT("--abbrev-ref"), TEXT("--symbolic-full-name"), TEXT("@{u}") };
+	if (!GitSourceControlUtils::RunCommand(TEXT("rev-parse"), InCommand.PathToGitBinary, Root, UpstreamParams,
+		FGitSourceControlModule::GetEmptyStringArray(), Results, Errors) || Results.Num() == 0 || Results[0].TrimStartAndEnd().IsEmpty())
+	{
+		return Refuse(FString::Printf(TEXT("Check out refused: upstream of '%s' is configured but could not be resolved after fetch."), *Branch));
+	}
+	const FString Upstream = Results[0].TrimStartAndEnd();
+
+	// 경로 필터 없이 아직 받지 않은 커밋의 변경 파일 전체를 받아 요청 파일과 대조한다.
+	// (pathspec은 대소문자를 구분해 Windows에서 casing이 다른 요청을 놓친다. FString 비교·TSet은 대소문자 무시.)
 	// --no-renames: 원격에서 이름이 바뀐 파일도 옛 경로로 나온다. 비ASCII 경로는 RunCommand가 core.quotePath=false로 받는다.
 	Results.Reset();
 	Errors.Reset();
-	const TArray<FString> LogParams{ TEXT("--no-renames"), TEXT("--pretty="), TEXT("--name-only"), TEXT("HEAD..@{u}"), TEXT("--") };
-	if (!GitSourceControlUtils::RunCommand(TEXT("log"), InCommand.PathToGitBinary, Root, LogParams, RelativeFiles, Results, Errors))
+	const TArray<FString> LogParams{ TEXT("--no-renames"), TEXT("--pretty="), TEXT("--name-only"), TEXT("HEAD..@{u}") };
+	if (!GitSourceControlUtils::RunCommand(TEXT("log"), InCommand.PathToGitBinary, Root, LogParams,
+		FGitSourceControlModule::GetEmptyStringArray(), Results, Errors))
 	{
-		InCommand.ResultInfo.ErrorMessages.Add(FString::Printf(TEXT("Check out refused: could not compare files with %s."), *Upstream));
-		InCommand.ResultInfo.ErrorMessages.Append(Errors);
-		return false;
+		return Refuse(FString::Printf(TEXT("Check out refused: could not compare files with %s."), *Upstream));
 	}
 
 	TSet<FString> Changed;
@@ -179,9 +208,7 @@ static bool EnsureFilesAtRemoteHead(FGitSourceControlCommand& InCommand, TMap<co
 	}
 	if (AbsoluteNewer.Num() == 0)
 	{
-		// 출력과 요청 경로를 대조하지 못했다 (대소문자 등). 안전하게 거부한다.
-		InCommand.ResultInfo.ErrorMessages.Add(FString::Printf(TEXT("Check out refused: files changed on %s but could not be matched to the request: %s"), *Upstream, *FString::Join(Changed.Array(), TEXT(", "))));
-		return false;
+		return true;
 	}
 	GitSourceControlUtils::CollectNewStates(AbsoluteNewer, OutStates, EFileState::Unset, ETreeState::Unset, ELockState::Unset, ERemoteState::NotAtHead);
 	return false;
